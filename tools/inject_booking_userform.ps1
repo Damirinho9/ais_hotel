@@ -1,170 +1,183 @@
+[CmdletBinding()]
 param(
-  [Parameter(Mandatory=$true)] [string]$WorkbookPath
+    [Parameter(Mandatory = $true)]
+    [string]$WorkbookPath,
+
+    [string]$MacroModulePath = ".\vba\HotelMacros.bas",
+    [string]$UserFormPath = ".\vba\frmBookingAdd.frm"
 )
 
 $ErrorActionPreference = 'Stop'
 
-if (!(Test-Path $WorkbookPath)) {
-  throw "Workbook not found: $WorkbookPath"
+function Resolve-RelativePath {
+    param([string]$Path)
+    if ([System.IO.Path]::IsPathRooted($Path)) { return (Resolve-Path $Path).Path }
+    return (Resolve-Path (Join-Path $PSScriptRoot "..\$Path")).Path
 }
 
-$excel = New-Object -ComObject Excel.Application
-$excel.Visible = $false
-$excel.DisplayAlerts = $false
+function Get-FormCodeFromFrm {
+    param([string]$FrmContent)
+    $start = $FrmContent.IndexOf("Private Sub UserForm_Initialize()")
+    if ($start -lt 0) {
+        throw "Не найден код формы (Private Sub UserForm_Initialize) в файле $UserFormPath"
+    }
+    return $FrmContent.Substring($start)
+}
+
+function Ensure-VBComponent {
+    param(
+        $VBProject,
+        [string]$Name,
+        [int]$Type
+    )
+
+    foreach ($comp in $VBProject.VBComponents) {
+        if ($comp.Name -eq $Name) { return $comp }
+    }
+
+    $newComp = $VBProject.VBComponents.Add($Type)
+    $newComp.Name = $Name
+    return $newComp
+}
+
+function Replace-Code {
+    param(
+        $CodeModule,
+        [string]$CodeText
+    )
+    $lineCount = $CodeModule.CountOfLines
+    if ($lineCount -gt 0) {
+        $CodeModule.DeleteLines(1, $lineCount)
+    }
+    $CodeModule.AddFromString($CodeText)
+}
+
+function Add-Control {
+    param(
+        $Designer,
+        [string]$ProgId,
+        [string]$Name,
+        [int]$Left,
+        [int]$Top,
+        [int]$Width,
+        [int]$Height,
+        [string]$Caption = $null
+    )
+
+    try {
+        $existing = $Designer.Controls.Item($Name)
+        if ($null -ne $existing) {
+            $existing.Left = $Left
+            $existing.Top = $Top
+            $existing.Width = $Width
+            $existing.Height = $Height
+            if ($null -ne $Caption) { $existing.Caption = $Caption }
+            return $existing
+        }
+    }
+    catch {}
+
+    $ctrl = $Designer.Controls.Add($ProgId, $Name, $true)
+    $ctrl.Left = $Left
+    $ctrl.Top = $Top
+    $ctrl.Width = $Width
+    $ctrl.Height = $Height
+    if ($null -ne $Caption) { $ctrl.Caption = $Caption }
+    return $ctrl
+}
+
+$workbookFullPath = if ([System.IO.Path]::IsPathRooted($WorkbookPath)) { $WorkbookPath } else { Join-Path (Get-Location) $WorkbookPath }
+if (-not (Test-Path $workbookFullPath)) {
+    throw "Файл книги не найден: $workbookFullPath"
+}
+
+$macroModuleFullPath = Resolve-RelativePath $MacroModulePath
+$userFormFullPath = Resolve-RelativePath $UserFormPath
+
+$macroCode = Get-Content -LiteralPath $macroModuleFullPath -Raw -Encoding UTF8
+$frmRaw = Get-Content -LiteralPath $userFormFullPath -Raw -Encoding UTF8
+$formCode = Get-FormCodeFromFrm -FrmContent $frmRaw
+
+$xl = $null
+$wb = $null
 
 try {
-  $wb = $excel.Workbooks.Open((Resolve-Path $WorkbookPath).Path)
-  $vbProj = $wb.VBProject
+    $xl = New-Object -ComObject Excel.Application
+    $xl.DisplayAlerts = $false
+    $xl.Visible = $false
 
-  # Ensure module HotelMacros exists
-  $stdModule = $null
-  foreach ($c in $vbProj.VBComponents) {
-    if ($c.Type -eq 1 -and $c.Name -eq 'HotelMacros') { $stdModule = $c; break }
-  }
-  if ($null -eq $stdModule) {
-    $stdModule = $vbProj.VBComponents.Add(1)
-    $stdModule.Name = 'HotelMacros'
-  }
+    $wb = $xl.Workbooks.Open($workbookFullPath)
+    $vbProj = $wb.VBProject
 
-  $macroCode = @'
-Attribute VB_Name = "HotelMacros"
-Option Explicit
+    # 1 = vbext_ct_StdModule
+    $moduleComp = Ensure-VBComponent -VBProject $vbProj -Name "HotelMacros" -Type 1
+    Replace-Code -CodeModule $moduleComp.CodeModule -CodeText $macroCode
 
-Public Sub ДобавитьБронь()
-    frmBookingAdd.Show
-End Sub
-'@
+    # 3 = vbext_ct_MSForm
+    $formComp = Ensure-VBComponent -VBProject $vbProj -Name "frmBookingAdd" -Type 3
+    $designer = $formComp.Designer
 
-  $stdModule.CodeModule.DeleteLines(1, $stdModule.CodeModule.CountOfLines)
-  $stdModule.CodeModule.AddFromString($macroCode)
+    $designer.Caption = "Добавить бронирование"
+    $designer.Width = 330
+    $designer.Height = 305
 
-  # Create or reuse UserForm
-  $frm = $null
-  foreach ($c in $vbProj.VBComponents) {
-    if ($c.Type -eq 3 -and $c.Name -eq 'frmBookingAdd') { $frm = $c; break }
-  }
-  if ($null -eq $frm) {
-    $frm = $vbProj.VBComponents.Add(3)
-    $frm.Name = 'frmBookingAdd'
-  }
+    # Labels
+    Add-Control -Designer $designer -ProgId "Forms.Label.1" -Name "lblRoom" -Left 12 -Top 18 -Width 85 -Height 18 -Caption "№ Комнаты:" | Out-Null
+    Add-Control -Designer $designer -ProgId "Forms.Label.1" -Name "lblGuest" -Left 12 -Top 52 -Width 85 -Height 18 -Caption "Гость:" | Out-Null
+    Add-Control -Designer $designer -ProgId "Forms.Label.1" -Name "lblCheckIn" -Left 12 -Top 86 -Width 85 -Height 18 -Caption "Дата заезда:" | Out-Null
+    Add-Control -Designer $designer -ProgId "Forms.Label.1" -Name "lblCheckOut" -Left 12 -Top 120 -Width 85 -Height 18 -Caption "Дата выезда:" | Out-Null
+    Add-Control -Designer $designer -ProgId "Forms.Label.1" -Name "lblGuestsCount" -Left 12 -Top 154 -Width 85 -Height 18 -Caption "Кол-во гостей:" | Out-Null
+    Add-Control -Designer $designer -ProgId "Forms.Label.1" -Name "lblPrice" -Left 12 -Top 188 -Width 85 -Height 18 -Caption "Цена/сутки:" | Out-Null
+    Add-Control -Designer $designer -ProgId "Forms.Label.1" -Name "lblStatus" -Left 12 -Top 222 -Width 85 -Height 18 -Caption "Статус:" | Out-Null
 
-  $designer = $frm.Designer
-  $designer.Caption = 'Добавить бронирование'
-  $designer.Width = 420
-  $designer.Height = 330
+    # Inputs
+    Add-Control -Designer $designer -ProgId "Forms.ComboBox.1" -Name "cboRoom" -Left 104 -Top 14 -Width 200 -Height 20 | Out-Null
+    Add-Control -Designer $designer -ProgId "Forms.ComboBox.1" -Name "cboGuest" -Left 104 -Top 48 -Width 200 -Height 20 | Out-Null
+    Add-Control -Designer $designer -ProgId "Forms.TextBox.1" -Name "txtCheckIn" -Left 104 -Top 82 -Width 200 -Height 20 | Out-Null
+    Add-Control -Designer $designer -ProgId "Forms.TextBox.1" -Name "txtCheckOut" -Left 104 -Top 116 -Width 200 -Height 20 | Out-Null
+    Add-Control -Designer $designer -ProgId "Forms.TextBox.1" -Name "txtGuestsCount" -Left 104 -Top 150 -Width 200 -Height 20 | Out-Null
+    Add-Control -Designer $designer -ProgId "Forms.TextBox.1" -Name "txtPrice" -Left 104 -Top 184 -Width 200 -Height 20 | Out-Null
+    Add-Control -Designer $designer -ProgId "Forms.ComboBox.1" -Name "cboStatus" -Left 104 -Top 218 -Width 200 -Height 20 | Out-Null
 
-  # Remove old controls
-  for ($i = $designer.Controls.Count; $i -ge 1; $i--) {
-    $designer.Controls.Remove($designer.Controls.Item($i-1).Name)
-  }
+    # Buttons
+    Add-Control -Designer $designer -ProgId "Forms.CommandButton.1" -Name "btnSave" -Left 104 -Top 252 -Width 96 -Height 26 -Caption "Сохранить" | Out-Null
+    Add-Control -Designer $designer -ProgId "Forms.CommandButton.1" -Name "btnCancel" -Left 208 -Top 252 -Width 96 -Height 26 -Caption "Отмена" | Out-Null
 
-  function Add-Label($name, $caption, $left, $top) {
-    $c = $designer.Controls.Add('Forms.Label.1', $name, $true)
-    $c.Caption = $caption
-    $c.Left = $left
-    $c.Top = $top
-    $c.Width = 140
-    return $c
-  }
+    Replace-Code -CodeModule $formComp.CodeModule -CodeText $formCode
 
-  function Add-Text($name, $left, $top) {
-    $c = $designer.Controls.Add('Forms.TextBox.1', $name, $true)
-    $c.Left = $left
-    $c.Top = $top
-    $c.Width = 220
-    return $c
-  }
+    # Привязка кнопки на листе Бронирование
+    try {
+        $ws = $wb.Worksheets("Бронирование")
+        try {
+            $shape = $ws.Shapes.Item("btn_add_booking")
+            if ($null -ne $shape) {
+                $shape.OnAction = "ДобавитьБронь"
+            }
+        }
+        catch {}
 
-  Add-Label 'lblGuest' 'Гость' 16 18 | Out-Null
-  Add-Text 'txtGuest' 160 16 | Out-Null
-
-  Add-Label 'lblRoom' 'Номер' 16 50 | Out-Null
-  Add-Text 'txtRoom' 160 48 | Out-Null
-
-  Add-Label 'lblCheckIn' 'Дата заезда (дд.мм.гггг)' 16 82 | Out-Null
-  Add-Text 'txtCheckIn' 160 80 | Out-Null
-
-  Add-Label 'lblCheckOut' 'Дата выезда (дд.мм.гггг)' 16 114 | Out-Null
-  Add-Text 'txtCheckOut' 160 112 | Out-Null
-
-  Add-Label 'lblStatus' 'Статус' 16 146 | Out-Null
-  Add-Text 'txtStatus' 160 144 | Out-Null
-
-  Add-Label 'lblPayment' 'Оплата' 16 178 | Out-Null
-  Add-Text 'txtPayment' 160 176 | Out-Null
-
-  $btnSave = $designer.Controls.Add('Forms.CommandButton.1', 'btnSave', $true)
-  $btnSave.Caption = 'Сохранить'
-  $btnSave.Left = 160
-  $btnSave.Top = 230
-  $btnSave.Width = 100
-
-  $btnCancel = $designer.Controls.Add('Forms.CommandButton.1', 'btnCancel', $true)
-  $btnCancel.Caption = 'Отмена'
-  $btnCancel.Left = 280
-  $btnCancel.Top = 230
-  $btnCancel.Width = 100
-
-  $formCode = @'
-Option Explicit
-
-Private Sub btnCancel_Click()
-    Unload Me
-End Sub
-
-Private Sub btnSave_Click()
-    Dim ws As Worksheet
-    Dim nextRow As Long
-
-    If Trim$(txtGuest.Value) = "" Or Trim$(txtRoom.Value) = "" Then
-        MsgBox "Заполните обязательные поля: Гость и Номер.", vbExclamation
-        Exit Sub
-    End If
-
-    If Not IsDate(txtCheckIn.Value) Or Not IsDate(txtCheckOut.Value) Then
-        MsgBox "Введите корректные даты заезда и выезда.", vbExclamation
-        Exit Sub
-    End If
-
-    If CDate(txtCheckOut.Value) < CDate(txtCheckIn.Value) Then
-        MsgBox "Дата выезда не может быть раньше даты заезда.", vbExclamation
-        Exit Sub
-    End If
-
-    Set ws = ThisWorkbook.Worksheets("Бронирование")
-    nextRow = ws.Cells(ws.Rows.Count, "A").End(xlUp).Row + 1
-    If nextRow < 2 Then nextRow = 2
-
-    ws.Cells(nextRow, 1).Value = nextRow - 1
-    ws.Cells(nextRow, 2).Value = Trim$(txtGuest.Value)
-    ws.Cells(nextRow, 3).Value = Trim$(txtRoom.Value)
-    ws.Cells(nextRow, 4).Value = CDate(txtCheckIn.Value)
-    ws.Cells(nextRow, 5).Value = CDate(txtCheckOut.Value)
-    ws.Cells(nextRow, 6).Value = Trim$(txtStatus.Value)
-    ws.Cells(nextRow, 7).Value = Trim$(txtPayment.Value)
-
-    MsgBox "Бронирование добавлено.", vbInformation
-    Unload Me
-End Sub
-'@
-
-  $frm.CodeModule.DeleteLines(1, $frm.CodeModule.CountOfLines)
-  $frm.CodeModule.AddFromString($formCode)
-
-  # Re-assign shape macro if shape exists
-  $ws = $wb.Worksheets.Item('Бронирование')
-  foreach ($shape in $ws.Shapes) {
-    if ($shape.Name -eq 'btn_add_booking') {
-      $shape.OnAction = 'ДобавитьБронь'
+        try {
+            $ole = $ws.OLEObjects("btn_add_booking")
+            if ($null -ne $ole) {
+                $ole.Object.Caption = "Добавить бронирование"
+            }
+        }
+        catch {}
     }
-  }
+    catch {
+        Write-Warning "Лист Бронирование или кнопка btn_add_booking не найдены для автопривязки."
+    }
 
-  $wb.Save()
-  $wb.Close($true)
+    $wb.Save()
+    Write-Host "Готово: форма и макрос внедрены в $workbookFullPath"
 }
 finally {
-  $excel.Quit()
-  [System.Runtime.InteropServices.Marshal]::ReleaseComObject($excel) | Out-Null
+    if ($null -ne $wb) { $wb.Close($true) | Out-Null }
+    if ($null -ne $xl) {
+        $xl.Quit()
+        if ($null -ne $wb) { [System.Runtime.InteropServices.Marshal]::ReleaseComObject($wb) | Out-Null }
+        [System.Runtime.InteropServices.Marshal]::ReleaseComObject($xl) | Out-Null
+    }
+    [GC]::Collect()
+    [GC]::WaitForPendingFinalizers()
 }
-
-Write-Host "Done: UserForm embedded into $WorkbookPath"
