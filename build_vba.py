@@ -709,7 +709,24 @@ def main():
         print("  Сохранён /tmp/debug_vba.bin для диагностики")
         raise
 
-    print("\n=== 7. Перепаковываем XLSM ===")
+    print("\n=== 7. Патчим кнопку 'Добавить' в vmlDrawing ===")
+    vml_path = os.path.join(xlsm_dir, 'xl', 'drawings', 'vmlDrawing7.vml')
+    if os.path.exists(vml_path):
+        with open(vml_path, 'r', encoding='utf-8') as f:
+            vml = f.read()
+        old_macro = 'ДобавитьБронь'
+        new_macro = 'ОткрытьФормуБронирования'
+        if old_macro in vml:
+            vml = vml.replace(old_macro, new_macro)
+            with open(vml_path, 'w', encoding='utf-8') as f:
+                f.write(vml)
+            print(f"  {old_macro} → {new_macro}")
+        else:
+            print(f"  Кнопка уже обновлена или макрос не найден")
+    else:
+        print(f"  vmlDrawing7.vml не найден")
+
+    print("\n=== 8. Перепаковываем XLSM ===")
     # Write new vbaProject.bin
     with open(vba_bin_path, 'wb') as f:
         f.write(new_vba_bin)
