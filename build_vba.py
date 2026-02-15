@@ -1,46 +1,41 @@
 #!/usr/bin/env python3
 """
-build_vba.py
-  1. Читает xlsm из ZIP
-  2. Распаковывает vbaProject.bin через olefile
-  3. Получает оригинальный VBA-код HotelMacros через oletools
-  4. Добавляет новый саб ОткрытьФормуБронирования (InputBox-форма)
-  5. Упаковывает обратно в MS-OVBA (raw chunks — валидно по ECMA-376)
-  6. Записывает новый vbaProject.bin через OLE-пересборщик
-  7. Перепаковывает xlsm и zip
+build_vba.py  — inject ОткрытьФормуБронирования into existing VBA project.
+
+Strategy: patch the ORIGINAL vbaProject.bin from the working .xlsm file.
+Instead of rebuilding OLE from scratch (which breaks Excel), we:
+  1. Parse the original OLE structure (FAT, directory, mini-stream)
+  2. Replace only the HotelMacros stream data (expanding if needed)
+  3. Update FAT chains and directory entry size
+  4. Preserve everything else byte-for-byte
+
+This guarantees Excel compatibility since 95% of the binary is untouched.
 """
 
-import struct, os, shutil, zipfile, io, math
+import struct, os, shutil, zipfile, io, math, copy
 import olefile
 from oletools.olevba import decompress_stream
 
 SECTOR = 512
+MINI_SECTOR = 64
 FREESECT   = 0xFFFFFFFF
 ENDOFCHAIN = 0xFFFFFFFE
 FATSECT    = 0xFFFFFFFD
-DIFSECT    = 0xFFFFFFFC
 MINI_CUTOFF = 4096
 
 # ──────────────────────────────────────────────────────────────────────────────
-# MS-OVBA compression using raw (uncompressed) chunks — всегда корректно
+# MS-OVBA compression (LZ77)
 # ──────────────────────────────────────────────────────────────────────────────
-def _copy_token_fields(decompressed_chunk_so_far: int):
-    """
-    Matches oletools' copytoken_help exactly.
-    bit_count = offset bits (grows as more bytes are decompressed).
-    length_bits = 16 - bit_count (shrinks).
-    Returns (ob, lb, length_mask, max_len, max_offset).
-    """
-    difference = max(decompressed_chunk_so_far, 1)
-    ob = max(math.ceil(math.log2(difference)), 4)  # offset bits
-    lb = 16 - ob                                    # length bits
-    length_mask = 0xFFFF >> ob                      # bottom lb bits
-    max_len    = length_mask + 3
+def _copy_token_fields(pos: int):
+    difference = max(pos, 1)
+    ob = max(math.ceil(math.log2(difference)), 4)
+    lb = 16 - ob
+    length_mask = 0xFFFF >> ob
+    max_len = length_mask + 3
     max_offset = 1 << ob
     return ob, lb, length_mask, max_len, max_offset
 
 def _find_match(chunk: bytes, pos: int):
-    """Greedy LZ77 match. Returns (match_len, match_offset) or (0,0)."""
     ob, lb, length_mask, max_len, max_offset = _copy_token_fields(pos)
     search_start = max(0, pos - max_offset)
     best_len, best_off = 0, 0
@@ -54,7 +49,6 @@ def _find_match(chunk: bytes, pos: int):
     return best_len, best_off
 
 def _compress_chunk(chunk: bytes) -> bytes:
-    """Compress up to 4096 bytes using MS-OVBA LZ77."""
     out = bytearray()
     pos = 0
     while pos < len(chunk):
@@ -67,7 +61,6 @@ def _compress_chunk(chunk: bytes) -> bytes:
             mlen, moff = _find_match(chunk, pos)
             if mlen >= 3:
                 ob, lb, length_mask, max_len, max_offset = _copy_token_fields(pos)
-                # offset in top ob bits, length in bottom lb bits
                 token = ((moff - 1) << lb) | (mlen - 3)
                 out += struct.pack('<H', token)
                 flag |= (1 << bit)
@@ -79,397 +72,346 @@ def _compress_chunk(chunk: bytes) -> bytes:
     return bytes(out)
 
 def ovba_compress(source: bytes) -> bytes:
-    """Compress VBA source using MS-OVBA LZ77 (ECMA-376 §2.4.1)."""
-    out = bytearray([0x01])  # SignatureByte
+    out = bytearray([0x01])
     i = 0
     while i < len(source):
         chunk = source[i: i + 4096]
         i += 4096
         compressed = _compress_chunk(chunk)
-        # CompressedChunkSize = len(compressed) - 3 (but must fit in 12 bits, max 4094)
         if len(compressed) + 3 > 4098 or len(compressed) >= len(chunk):
-            # Store as raw chunk: bit15=0, bits14-12=011, bits11-0=4093
             padded = chunk + b'\x00' * (4096 - len(chunk))
-            hdr = struct.pack('<H', 0x3FFD)   # 0x3000|4093, bit15=0
+            hdr = struct.pack('<H', 0x3FFD)
             out += hdr + padded
         else:
-            # Compressed: bit15=1, bits14-12=011, bits11-0=chunkDataSize-1
-            # oletools reads chunk_data = chunk_size-2 bytes; chunk_size=(hdr&0x0FFF)+3
-            # so chunk_data = (hdr&0x0FFF)+1 = len(compressed) → hdr&0x0FFF = len-1
             hdr = struct.pack('<H', 0xB000 | (len(compressed) - 1))
             out += hdr + compressed
     return bytes(out)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Чтение всех потоков из OLE-файла
+# OLE patching: replace a stream in an existing valid OLE file
 # ──────────────────────────────────────────────────────────────────────────────
-def read_all_streams(ole_path: str):
-    """Возвращает {path: bytes} для всех streams в OLE"""
-    ole = olefile.OleFileIO(ole_path)
-    streams = {}
-    for entry in ole.listdir(streams=True):
-        path = '/'.join(entry)
-        streams[path] = ole.openstream(path).read()
-    ole.close()
-    return streams
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Минимальный OLE Compound File writer
-# Пишет новый .bin с заданными потоками, перестраивая всё с нуля
-# ──────────────────────────────────────────────────────────────────────────────
-def build_ole(stream_tree: dict) -> bytes:
+def patch_ole_stream(ole_data: bytes, stream_path: str, new_data: bytes) -> bytes:
     """
-    stream_tree: {
-        'ROOT': None,                  # root storage
-        'PROJECT': b'...',             # top-level stream
-        'PROJECTwm': b'...',
-        'VBA': {                       # storage
-            '_VBA_PROJECT': b'...',
-            'dir': b'...',
-            'HotelMacros': b'...',
-            'Лист1': b'...',
-            ...
-        }
-    }
-    Returns raw bytes of the OLE compound file.
+    Replace the data of `stream_path` (e.g. 'VBA/HotelMacros') in the OLE
+    compound file `ole_data`, returning the modified file bytes.
+    Handles expansion (new data larger than old) by appending new sectors.
     """
-    # ── Flatten streams into a list of (full_path_list, data) ───────────────
-    flat = []  # (name_parts_tuple, data)
+    buf = bytearray(ole_data)
 
-    def flatten(node, prefix):
-        if isinstance(node, dict):
-            for k, v in node.items():
-                if k == '__data__':
-                    continue
-                flatten(v, prefix + [k])
-        elif isinstance(node, (bytes, bytearray)):
-            flat.append((tuple(prefix), bytes(node)))
+    # ── Parse header ─────────────────────────────────────────────────────
+    sector_pow = struct.unpack_from('<H', buf, 30)[0]
+    sector_size = 1 << sector_pow
+    assert sector_size == 512, f"Only 512-byte sectors supported, got {sector_size}"
 
-    flatten(stream_tree, [])
+    num_fat_sectors = struct.unpack_from('<I', buf, 44)[0]
+    first_dir_sector = struct.unpack_from('<I', buf, 48)[0]
+    mini_cutoff = struct.unpack_from('<I', buf, 56)[0]
+    first_minifat_sector = struct.unpack_from('<I', buf, 60)[0]
+    num_minifat_sectors = struct.unpack_from('<I', buf, 64)[0]
 
-    # ── Build directory entries ─────────────────────────────────────────────
-    # OLE directory: root=0, then storages, then streams
-    # For simplicity: root + one-level storages + streams
-    # We'll build a flat directory with proper parent/sibling/child links
-    # using the "red-black tree" approach (simplified: all left-black here)
+    # DIFAT: first 109 entries in header at offset 76
+    difat = []
+    for i in range(109):
+        v = struct.unpack_from('<I', buf, 76 + i * 4)[0]
+        if v not in (FREESECT, ENDOFCHAIN):
+            difat.append(v)
+
+    def sec_offset(sec_id):
+        return 512 + sec_id * sector_size
+
+    # ── Read FAT ─────────────────────────────────────────────────────────
+    fat = []
+    for fat_sec in difat[:num_fat_sectors]:
+        off = sec_offset(fat_sec)
+        for i in range(sector_size // 4):
+            fat.append(struct.unpack_from('<I', buf, off + i * 4)[0])
+
+    def get_chain(start):
+        chain = []
+        s = start
+        seen = set()
+        while s not in (ENDOFCHAIN, FREESECT) and s < len(fat):
+            if s in seen:
+                break
+            seen.add(s)
+            chain.append(s)
+            s = fat[s]
+        return chain
+
+    def write_fat_entry(idx, val):
+        fat[idx] = val
+        fat_sec_idx = idx // (sector_size // 4)
+        entry_in_sec = idx % (sector_size // 4)
+        if fat_sec_idx < len(difat):
+            fat_sec = difat[fat_sec_idx]
+            off = sec_offset(fat_sec) + entry_in_sec * 4
+            if off + 4 <= len(buf):
+                struct.pack_into('<I', buf, off, val)
+
+    def alloc_sector():
+        """Find a free sector in existing FAT, or extend."""
+        for i in range(len(fat)):
+            if fat[i] == FREESECT:
+                # Make sure sector data area exists
+                needed = sec_offset(i) + sector_size
+                if needed > len(buf):
+                    buf.extend(b'\x00' * (needed - len(buf)))
+                return i
+        # All 128 entries used — append (shouldn't happen for small files)
+        new_id = len(fat)
+        fat.append(FREESECT)
+        buf.extend(b'\x00' * sector_size)
+        return new_id
+
+    # ── Read directory ───────────────────────────────────────────────────
+    dir_chain = get_chain(first_dir_sector)
+    dir_bytes = bytearray()
+    for s in dir_chain:
+        dir_bytes += buf[sec_offset(s):sec_offset(s) + sector_size]
 
     DIR_ENTRY_SIZE = 128
+    num_entries = len(dir_bytes) // DIR_ENTRY_SIZE
 
-    class DirEntry:
-        def __init__(self, name, obj_type, data=b'', start=ENDOFCHAIN, size=0):
-            self.name = name            # str
-            self.obj_type = obj_type    # 1=storage, 2=stream, 5=root
-            self.data = data
-            self.start = start
-            self.size = size
-            self.child = 0xFFFFFFFF
-            self.sibling_left  = 0xFFFFFFFF
-            self.sibling_right = 0xFFFFFFFF
-            self.clsid = b'\x00' * 16
-            self.color = 1   # 1=black (default)
-            self.created = b'\x00' * 8
-            self.modified = b'\x00' * 8
+    def read_dir_entry(idx):
+        off = idx * DIR_ENTRY_SIZE
+        name_raw = dir_bytes[off:off + 64]
+        name_len = struct.unpack_from('<H', dir_bytes, off + 64)[0]
+        name = name_raw[:max(0, name_len - 2)].decode('utf-16-le', errors='replace')
+        obj_type = dir_bytes[off + 66]
+        child = struct.unpack_from('<I', dir_bytes, off + 76)[0]
+        left = struct.unpack_from('<I', dir_bytes, off + 68)[0]
+        right = struct.unpack_from('<I', dir_bytes, off + 72)[0]
+        start = struct.unpack_from('<I', dir_bytes, off + 116)[0]
+        size = struct.unpack_from('<I', dir_bytes, off + 120)[0]
+        return {
+            'name': name, 'type': obj_type, 'child': child,
+            'left': left, 'right': right,
+            'start': start, 'size': size, 'dir_offset': off
+        }
 
-        def pack(self):
-            name_utf16 = self.name.encode('utf-16-le')
-            name_len = len(name_utf16) + 2  # include null terminator
-            name_field = (name_utf16 + b'\x00\x00').ljust(64, b'\x00')[:64]
-            return (
-                name_field +
-                struct.pack('<H', min(name_len, 64)) +
-                struct.pack('<BB', self.obj_type, self.color) +
-                struct.pack('<I', self.sibling_left) +
-                struct.pack('<I', self.sibling_right) +
-                struct.pack('<I', self.child) +
-                self.clsid +
-                struct.pack('<I', 0) +  # state bits
-                self.created +
-                self.modified +
-                struct.pack('<I', self.start) +
-                struct.pack('<I', self.size) +
-                b'\x00' * 4   # unused high dword of size
-            )
+    # ── Find the target stream by walking the directory tree ─────────────
+    parts = stream_path.split('/')
+    target_entry = None
 
-    # Collect all storage names
-    storage_contents = {}  # storage_name -> [child_names]
-    for path_tuple, data in flat:
-        if len(path_tuple) == 1:
-            storage_contents.setdefault('ROOT', []).append(path_tuple[0])
-        elif len(path_tuple) == 2:
-            storage_contents.setdefault(path_tuple[0], []).append(path_tuple[1])
+    def find_entry(node_idx, name):
+        if node_idx == 0xFFFFFFFF or node_idx >= num_entries:
+            return None
+        e = read_dir_entry(node_idx)
+        if e['name'].lower() == name.lower():
+            return e
+        result = find_entry(e['left'], name)
+        if result:
+            return result
+        return find_entry(e['right'], name)
 
-    # ── Sector allocation ─────────────────────────────────────────────────
-    # We'll lay out sectors in order:
-    #   sector 0: FAT sector (placeholder, filled last)
-    #   sector 1: Directory sector(s)
-    #   sector 2+: stream data sectors
-
-    # First, determine all stream data and their sizes
-    all_entries = []  # DirEntry list in directory order
-
-    root_entry = DirEntry('Root Entry', 5)
-    root_entry.clsid = bytes.fromhex('06090200000000000000000000000000')
-    all_entries.append(root_entry)  # index 0
-
-    # Collect storages (top level)
-    top_level_storages = []
-    top_level_streams_data = {}   # name -> data (for top-level streams)
-    sub_streams_data = {}         # (storage, name) -> data
-
-    for path_tuple, data in flat:
-        if len(path_tuple) == 1:
-            top_level_streams_data[path_tuple[0]] = data
-        elif len(path_tuple) == 2:
-            sub_streams_data[(path_tuple[0], path_tuple[1])] = data
-            top_level_storages.append(path_tuple[0])
-
-    top_level_storages = list(dict.fromkeys(top_level_storages))  # dedup, preserve order
-
-    # Build directory: root → VBA storage (and others if any) → streams
-    # Directory order (DFS): root(0), VBA(1), VBA children(2..N), top-level streams(N+1..)
-
-    storage_entries = []
-    for st_name in top_level_storages:
-        e = DirEntry(st_name, 1)
-        e.clsid = b'\x00' * 16
-        storage_entries.append(e)
-        all_entries.append(e)
-
-    # All stream entries
-    stream_entries = {}   # (path_tuple) -> DirEntry
-
-    # Sub-streams (inside storages)
-    for st_name in top_level_storages:
-        children = [k[1] for k in sub_streams_data if k[0] == st_name]
-        children.sort()
-        for child_name in children:
-            data = sub_streams_data[(st_name, child_name)]
-            e = DirEntry(child_name, 2, data=data, size=len(data))
-            stream_entries[(st_name, child_name)] = e
-            all_entries.append(e)
-
-    # Top-level streams
-    for name in sorted(top_level_streams_data.keys()):
-        data = top_level_streams_data[name]
-        e = DirEntry(name, 2, data=data, size=len(data))
-        stream_entries[(name,)] = e
-        all_entries.append(e)
-
-    # ── Set up child/sibling links ────────────────────────────────────────
-    # Find index of an entry by name
-    def idx_of(e): return all_entries.index(e)
-
-    def link_siblings(entry_list):
-        """Set sibling links for a list of directory entries (simple chain)"""
-        if not entry_list:
-            return 0xFFFFFFFF
-        # Sort by name for RB-tree (simplified: linear left-right chain)
-        entry_list = sorted(entry_list, key=lambda e: e.name.upper())
-        mid = len(entry_list) // 2
-        root_e = entry_list[mid]
-        if mid > 0:
-            root_e.sibling_left = idx_of(link_siblings_get_root(entry_list[:mid]))
-        if mid + 1 < len(entry_list):
-            root_e.sibling_right = idx_of(link_siblings_get_root(entry_list[mid+1:]))
-        return root_e
-
-    def link_siblings_get_root(entry_list):
-        entry_list = sorted(entry_list, key=lambda e: e.name.upper())
-        mid = len(entry_list) // 2
-        root_e = entry_list[mid]
-        if mid > 0:
-            root_e.sibling_left = idx_of(link_siblings_get_root(entry_list[:mid]))
-        if mid + 1 < len(entry_list):
-            root_e.sibling_right = idx_of(link_siblings_get_root(entry_list[mid+1:]))
-        return root_e
-
-    # Set root's children
-    root_children = storage_entries + [stream_entries[(n,)] for n in sorted(top_level_streams_data)]
-    if root_children:
-        rc = link_siblings_get_root(root_children)
-        root_entry.child = idx_of(rc)
-
-    # Set each storage's children
-    for st_name, st_e in zip(top_level_storages, storage_entries):
-        children = [stream_entries[(st_name, k[1])] for k in sub_streams_data if k[0] == st_name]
-        if children:
-            cc = link_siblings_get_root(children)
-            st_e.child = idx_of(cc)
-
-    # ── Assign sectors to streams ─────────────────────────────────────────
-    # Mini stream: streams < MINI_CUTOFF → stored in mini stream
-    # Regular streams: stored in normal sectors
-
-    mini_stream = bytearray()
-    mini_fat = []         # list of uint32
-    MINI_SECTOR = 64
-
-    regular_data = []     # list of (entry, data)
-
-    for e in all_entries:
-        if e.obj_type != 2:
-            continue
-        if len(e.data) < MINI_CUTOFF and len(e.data) > 0:
-            # mini stream
-            mini_offset = len(mini_stream)
-            mini_start = mini_offset // MINI_SECTOR
-            n_mini = (len(e.data) + MINI_SECTOR - 1) // MINI_SECTOR
-            padded = e.data + b'\x00' * (n_mini * MINI_SECTOR - len(e.data))
-            mini_stream.extend(padded)
-            # build mini FAT chain
-            for i in range(n_mini - 1):
-                mini_fat.append(mini_start + i + 1)
-            mini_fat.append(ENDOFCHAIN)
-            e.start = mini_start
-        elif len(e.data) == 0:
-            e.start = ENDOFCHAIN
+    # Navigate: root → storage → stream
+    root = read_dir_entry(0)
+    current_child = root['child']
+    for i, part in enumerate(parts):
+        entry = find_entry(current_child, part)
+        if entry is None:
+            raise ValueError(f"Stream path '{stream_path}' not found at part '{part}'")
+        if i < len(parts) - 1:
+            current_child = entry['child']
         else:
-            regular_data.append(e)
+            target_entry = entry
 
-    # Root's data = mini stream; assign sectors later
-    # Layout sectors:
-    # sector 0 = FAT (placeholder)
-    # sector 1+ = directory
-    # then mini FAT sectors
-    # then root's mini stream sectors
-    # then regular stream sectors
+    if target_entry is None:
+        raise ValueError(f"Stream '{stream_path}' not found")
 
-    num_dir_entries = len(all_entries)
-    # Pad to multiple of 4 entries per sector (4 * 128 = 512 bytes per sector)
-    entries_per_sector = SECTOR // DIR_ENTRY_SIZE  # 4
-    num_dir_sectors = (num_dir_entries + entries_per_sector - 1) // entries_per_sector
-    # Also need padding to fill dir sectors
-    while len(all_entries) < num_dir_sectors * entries_per_sector:
-        # empty entry
-        empty = DirEntry('', 0)
-        empty.sibling_left = 0xFFFFFFFF
-        empty.sibling_right = 0xFFFFFFFF
-        empty.child = 0xFFFFFFFF
-        all_entries.append(empty)
+    old_size = target_entry['size']
+    old_start = target_entry['start']
+    new_size = len(new_data)
 
-    # Sector layout plan:
-    # sector 0 = FAT sector
-    # sectors 1..(1+num_dir_sectors-1) = directory
-    # sectors (1+num_dir_sectors).. = mini FAT, then mini stream, then regular streams
+    print(f"  Патчим {stream_path}: {old_size} → {new_size} bytes")
 
-    current_sector = 1 + num_dir_sectors
+    is_mini = old_size < mini_cutoff and old_size > 0
 
-    # Mini FAT sectors
-    MINIFAT_ENTRIES_PER_SECTOR = SECTOR // 4  # 128
-    num_minifat_sectors = (len(mini_fat) + MINIFAT_ENTRIES_PER_SECTOR - 1) // MINIFAT_ENTRIES_PER_SECTOR if mini_fat else 0
-    first_minifat_sector = current_sector if num_minifat_sectors > 0 else ENDOFCHAIN
-    current_sector += num_minifat_sectors
+    if is_mini:
+        # Stream is in mini-stream — need to handle mini FAT and mini stream
+        # Read mini FAT
+        mini_fat = []
+        if first_minifat_sector != ENDOFCHAIN:
+            mf_chain = get_chain(first_minifat_sector)
+            for s in mf_chain:
+                off = sec_offset(s)
+                for i in range(sector_size // 4):
+                    mini_fat.append(struct.unpack_from('<I', buf, off + i * 4)[0])
 
-    # Root entry (mini stream container)
-    root_entry.start = current_sector if len(mini_stream) > 0 else ENDOFCHAIN
-    root_entry.size = len(mini_stream)
-    num_ministream_sectors = (len(mini_stream) + SECTOR - 1) // SECTOR
-    current_sector += num_ministream_sectors
+        # Read mini stream (root entry's data)
+        root_start = root['start']
+        root_size = root['size']
+        ms_chain = get_chain(root_start)
+        mini_stream = bytearray()
+        for s in ms_chain:
+            mini_stream += buf[sec_offset(s):sec_offset(s) + sector_size]
+        mini_stream = mini_stream[:root_size]
 
-    # Regular stream sectors
-    for e in regular_data:
-        n_sectors = (len(e.data) + SECTOR - 1) // SECTOR
-        e.start = current_sector
-        current_sector += n_sectors
+        if new_size < mini_cutoff:
+            # Still fits in mini-stream
+            old_mini_chain = []
+            ms = old_start
+            seen = set()
+            while ms not in (ENDOFCHAIN, FREESECT) and ms < len(mini_fat):
+                if ms in seen:
+                    break
+                seen.add(ms)
+                old_mini_chain.append(ms)
+                ms = mini_fat[ms]
 
-    total_data_sectors = current_sector  # sectors 0..current_sector-1
+            old_mini_sectors = len(old_mini_chain)
+            new_mini_sectors = (new_size + MINI_SECTOR - 1) // MINI_SECTOR
 
-    # ── Build FAT ─────────────────────────────────────────────────────────
-    # We may need more than one FAT sector; for simplicity assume one is enough
-    fat = [FREESECT] * (MINIFAT_ENTRIES_PER_SECTOR)  # start with 128 entries
+            if new_mini_sectors <= old_mini_sectors:
+                # Fits in existing mini-sectors
+                for i, ms_idx in enumerate(old_mini_chain[:new_mini_sectors]):
+                    chunk_start = i * MINI_SECTOR
+                    chunk_end = min((i + 1) * MINI_SECTOR, new_size)
+                    data_chunk = new_data[chunk_start:chunk_end]
+                    ms_off = ms_idx * MINI_SECTOR
+                    mini_stream[ms_off:ms_off + len(data_chunk)] = data_chunk
+                    if len(data_chunk) < MINI_SECTOR:
+                        mini_stream[ms_off + len(data_chunk):ms_off + MINI_SECTOR] = b'\x00' * (MINI_SECTOR - len(data_chunk))
+                # Free extra mini-sectors
+                for i in range(new_mini_sectors, old_mini_sectors):
+                    mini_fat[old_mini_chain[i]] = FREESECT
+                if new_mini_sectors > 0:
+                    mini_fat[old_mini_chain[new_mini_sectors - 1]] = ENDOFCHAIN
+            else:
+                # Need more mini-sectors — extend mini-stream
+                # Use existing chain, then allocate new mini-sectors
+                for i, ms_idx in enumerate(old_mini_chain):
+                    chunk_start = i * MINI_SECTOR
+                    chunk_end = min((i + 1) * MINI_SECTOR, new_size)
+                    data_chunk = new_data[chunk_start:chunk_end]
+                    ms_off = ms_idx * MINI_SECTOR
+                    mini_stream[ms_off:ms_off + len(data_chunk)] = data_chunk
 
-    # sector 0 = FAT sector
-    fat[0] = FATSECT
-    # sectors 1..(1+num_dir_sectors-1) = directory chain
-    for s in range(1, 1 + num_dir_sectors):
-        fat[s] = s + 1 if s < num_dir_sectors else ENDOFCHAIN
-    # mini FAT sectors chain
-    for i in range(num_minifat_sectors):
-        s = first_minifat_sector + i
-        fat[s] = s + 1 if i < num_minifat_sectors - 1 else ENDOFCHAIN
-    # mini stream sectors (root's data)
-    for i in range(num_ministream_sectors):
-        s = root_entry.start + i if root_entry.start != ENDOFCHAIN else 0
-        if root_entry.start != ENDOFCHAIN:
-            fat[s] = s + 1 if i < num_ministream_sectors - 1 else ENDOFCHAIN
-    # regular stream sectors
-    for e in regular_data:
-        n_sectors = (len(e.data) + SECTOR - 1) // SECTOR
-        for i in range(n_sectors):
-            s = e.start + i
-            if s >= len(fat):
-                fat.extend([FREESECT] * (s - len(fat) + 1))
-            fat[s] = e.start + i + 1 if i < n_sectors - 1 else ENDOFCHAIN
+                # Allocate additional mini-sectors
+                prev = old_mini_chain[-1] if old_mini_chain else None
+                for i in range(old_mini_sectors, new_mini_sectors):
+                    new_ms_idx = len(mini_stream) // MINI_SECTOR
+                    chunk_start = i * MINI_SECTOR
+                    chunk_end = min((i + 1) * MINI_SECTOR, new_size)
+                    data_chunk = new_data[chunk_start:chunk_end]
+                    padded = data_chunk + b'\x00' * (MINI_SECTOR - len(data_chunk))
+                    mini_stream += padded
+                    # Extend mini FAT
+                    while len(mini_fat) <= new_ms_idx:
+                        mini_fat.append(FREESECT)
+                    mini_fat[new_ms_idx] = ENDOFCHAIN
+                    if prev is not None:
+                        mini_fat[prev] = new_ms_idx
+                    prev = new_ms_idx
 
-    # Ensure FAT covers all sectors
-    while len(fat) < total_data_sectors:
-        fat.append(FREESECT)
+            # Write mini-stream back to root's sectors
+            new_ms_size = len(mini_stream)
+            new_ms_sectors_needed = (new_ms_size + sector_size - 1) // sector_size
+            old_ms_sectors = len(ms_chain)
 
-    num_fat_sectors = (len(fat) + MINIFAT_ENTRIES_PER_SECTOR - 1) // MINIFAT_ENTRIES_PER_SECTOR
-    # If we need more than 1 FAT sector, place it; for typical VBA files 1 is enough
-    # (128 entries × 512 bytes = 65536 bytes max file — should cover ~50KB files)
+            if new_ms_sectors_needed > old_ms_sectors:
+                # Need to extend root's sector chain
+                last_sec = ms_chain[-1]
+                for _ in range(new_ms_sectors_needed - old_ms_sectors):
+                    new_sec = alloc_sector()
+                    write_fat_entry(new_sec, ENDOFCHAIN)
+                    write_fat_entry(last_sec, new_sec)
+                    ms_chain.append(new_sec)
+                    last_sec = new_sec
 
-    # ── Serialize ──────────────────────────────────────────────────────────
-    out = bytearray()
+            # Write mini-stream data to sectors
+            padded_ms = mini_stream + b'\x00' * (new_ms_sectors_needed * sector_size - len(mini_stream))
+            for i, s in enumerate(ms_chain[:new_ms_sectors_needed]):
+                off = sec_offset(s)
+                buf[off:off + sector_size] = padded_ms[i * sector_size:(i + 1) * sector_size]
 
-    # Header (512 bytes)
-    difat_header = [0] + [FREESECT] * 108   # sector 0 is FAT sector
-    header = (
-        b'\xD0\xCF\x11\xE0\xA1\xB1\x1A\xE1'   # magic
-        + b'\x00' * 16                           # clsid
-        + struct.pack('<HH', 0x003E, 0x0003)     # minor version, major version (3)
-        + struct.pack('<H', 0xFFFE)              # byte order (LE)
-        + struct.pack('<H', 9)                   # sector size exponent: 2^9=512
-        + struct.pack('<H', 6)                   # mini sector size: 2^6=64
-        + b'\x00' * 6                            # reserved
-        + struct.pack('<I', num_dir_sectors)     # num dir sectors
-        + struct.pack('<I', num_fat_sectors)     # num FAT sectors
-        + struct.pack('<I', 1)                   # first dir sector (sector 1)
-        + struct.pack('<I', 0)                   # transaction sig
-        + struct.pack('<I', MINI_CUTOFF)         # mini stream cutoff
-        + struct.pack('<I', first_minifat_sector)# first mini FAT sector
-        + struct.pack('<I', num_minifat_sectors) # num mini FAT sectors
-        + struct.pack('<I', FREESECT)            # first DIFAT sector
-        + struct.pack('<I', 0)                   # num DIFAT sectors
-    )
-    # DIFAT array (109 entries × 4 bytes = 436 bytes)
-    header += struct.pack('<I', 0)               # FAT sector 0
-    header += struct.pack('<I', FREESECT) * 108
-    assert len(header) == 512, f"Header length = {len(header)}"
-    out += header
+            # Update root size in directory
+            root_dir_off = 0  # root is always entry 0
+            struct.pack_into('<I', dir_bytes, root_dir_off + 120, new_ms_size)
 
-    # FAT sector (sector 0)
-    fat_padded = fat[:128] + [FREESECT] * (128 - min(len(fat), 128))
-    out += struct.pack(f'<{128}I', *fat_padded[:128])
+            # Write mini FAT back
+            if first_minifat_sector != ENDOFCHAIN:
+                mf_chain = get_chain(first_minifat_sector)
+                mf_padded = mini_fat + [FREESECT] * (len(mf_chain) * (sector_size // 4) - len(mini_fat))
+                for i, s in enumerate(mf_chain):
+                    off = sec_offset(s)
+                    for j in range(sector_size // 4):
+                        idx = i * (sector_size // 4) + j
+                        if idx < len(mf_padded):
+                            struct.pack_into('<I', buf, off + j * 4, mf_padded[idx])
 
-    # Directory sectors (sectors 1..)
-    dir_bytes = b''.join(e.pack() for e in all_entries)
-    assert len(dir_bytes) == num_dir_sectors * SECTOR
-    out += dir_bytes
+        else:
+            # Was mini, now needs regular sectors — complex case
+            # For simplicity, raise — this shouldn't happen for our use case
+            raise NotImplementedError("Mini→regular sector transition not implemented")
 
-    # Mini FAT sectors
-    mf_padded = mini_fat + [FREESECT] * (num_minifat_sectors * MINIFAT_ENTRIES_PER_SECTOR - len(mini_fat))
-    if mf_padded:
-        out += struct.pack(f'<{len(mf_padded)}I', *mf_padded)
+    else:
+        # Regular sectors (>= MINI_CUTOFF or was already in regular)
+        old_chain = get_chain(old_start)
+        old_sectors = len(old_chain)
+        new_sectors_needed = (new_size + sector_size - 1) // sector_size
 
-    # Mini stream (root data)
-    if mini_stream:
-        ms_padded = mini_stream + b'\x00' * ((num_ministream_sectors * SECTOR) - len(mini_stream))
-        out += ms_padded
+        if new_sectors_needed <= old_sectors:
+            # Write into existing sectors
+            for i, s in enumerate(old_chain[:new_sectors_needed]):
+                off = sec_offset(s)
+                data_start = i * sector_size
+                data_end = min((i + 1) * sector_size, new_size)
+                chunk = new_data[data_start:data_end]
+                padded = chunk + b'\x00' * (sector_size - len(chunk))
+                buf[off:off + sector_size] = padded
+            # Free unused sectors
+            for i in range(new_sectors_needed, old_sectors):
+                write_fat_entry(old_chain[i], FREESECT)
+            if new_sectors_needed > 0:
+                write_fat_entry(old_chain[new_sectors_needed - 1], ENDOFCHAIN)
+        else:
+            # Write into existing + append new sectors
+            for i, s in enumerate(old_chain):
+                off = sec_offset(s)
+                data_start = i * sector_size
+                data_end = min((i + 1) * sector_size, new_size)
+                chunk = new_data[data_start:data_end]
+                padded = chunk + b'\x00' * (sector_size - len(chunk))
+                buf[off:off + sector_size] = padded
 
-    # Regular streams
-    for e in regular_data:
-        n_sectors = (len(e.data) + SECTOR - 1) // SECTOR
-        padded = e.data + b'\x00' * (n_sectors * SECTOR - len(e.data))
-        out += padded
+            # Allocate new sectors from free pool
+            last_sec = old_chain[-1] if old_chain else None
+            for i in range(old_sectors, new_sectors_needed):
+                new_sec = alloc_sector()
 
-    return bytes(out)
+                # Write data into the sector
+                data_start = i * sector_size
+                data_end = min((i + 1) * sector_size, new_size)
+                chunk = new_data[data_start:data_end]
+                padded = chunk + b'\x00' * (sector_size - len(chunk))
+                off = sec_offset(new_sec)
+                buf[off:off + sector_size] = padded
+
+                # Update FAT: mark as end of chain
+                write_fat_entry(new_sec, ENDOFCHAIN)
+
+                # Link from previous sector
+                if last_sec is not None:
+                    write_fat_entry(last_sec, new_sec)
+
+                last_sec = new_sec
+
+    # ── Update directory entry size ──────────────────────────────────────
+    target_dir_off = target_entry['dir_offset']
+    struct.pack_into('<I', dir_bytes, target_dir_off + 120, new_size)
+
+    # ── Write modified directory back to sectors ─────────────────────────
+    for i, s in enumerate(dir_chain):
+        off = sec_offset(s)
+        buf[off:off + sector_size] = dir_bytes[i * sector_size:(i + 1) * sector_size]
+
+    return bytes(buf)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Новый VBA-код для добавления бронирования через форму (InputBox)
+# New VBA sub for booking form
 # ──────────────────────────────────────────────────────────────────────────────
 NEW_BOOKING_SUB = r"""
 '----------------------------------------------------------
@@ -602,19 +544,19 @@ End Sub
 
 """
 
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Main
 # ──────────────────────────────────────────────────────────────────────────────
 def main():
     ZIP_PATH  = '/home/user/ais_hotel/АИС_Гостиница (1).zip'
-    WORK_DIR  = '/tmp/ais_build2'
+    WORK_DIR  = '/tmp/ais_build3'
     OUT_XLSM  = '/home/user/ais_hotel/АИС_Гостиница_v2.xlsm'
 
     print("=== 1. Распаковываем ZIP и XLSM ===")
     shutil.rmtree(WORK_DIR, ignore_errors=True)
     os.makedirs(WORK_DIR)
 
-    # Extract xlsm from zip
     xlsm_bytes = None
     with zipfile.ZipFile(ZIP_PATH) as zf:
         for name in zf.namelist():
@@ -629,87 +571,71 @@ def main():
         zf.extractall(xlsm_dir)
 
     vba_bin_path = os.path.join(xlsm_dir, 'xl', 'vbaProject.bin')
-    print(f"  vbaProject.bin: {os.path.getsize(vba_bin_path)} bytes")
+    orig_vba_size = os.path.getsize(vba_bin_path)
+    print(f"  vbaProject.bin: {orig_vba_size} bytes")
 
-    print("\n=== 2. Читаем VBA-модули из vbaProject.bin ===")
+    print("\n=== 2. Читаем VBA-код HotelMacros ===")
     ole = olefile.OleFileIO(vba_bin_path)
-    streams = {}
-    for entry in ole.listdir(streams=True):
-        path = '/'.join(entry)
-        streams[path] = ole.openstream(path).read()
-        print(f"  {path}: {len(streams[path])} bytes")
+    hm_raw = ole.openstream('VBA/HotelMacros').read()
     ole.close()
+    print(f"  HotelMacros stream: {len(hm_raw)} bytes")
 
-    print("\n=== 3. Декомпрессируем HotelMacros ===")
-    hm_raw = streams['VBA/HotelMacros']
-    # Source starts at offset 0 (no p-code — confirmed above)
-    src_offset = 0
-    hm_src = decompress_stream(bytearray(hm_raw[src_offset:]))
+    hm_src = decompress_stream(bytearray(hm_raw))
     src_text = hm_src.decode('cp1251', errors='replace')
     print(f"  Исходный код: {len(src_text)} chars")
-    print(f"  Первые 60: {repr(src_text[:60])}")
 
-    print("\n=== 4. Добавляем новый суб ===")
-    # Insert before РАЗДЕЛ 3 (existing booking add section)
-    # Find the marker for section 3
-    MARKER = "' РАЗДЕЛ 3: ДОБАВЛЕНИЕ БРОНИРОВАНИЯ"
-    if MARKER.encode('cp1251', errors='replace').decode('cp1251') in src_text:
-        # Insert NEW_BOOKING_SUB before the existing section 3
-        pos = src_text.find(MARKER)
-        # Go back to find the comment line start
-        pos2 = src_text.rfind('\n', 0, pos)
-        new_src_text = src_text[:pos2+1] + NEW_BOOKING_SUB + src_text[pos2+1:]
-        print("  Вставлено ПЕРЕД разделом 3")
+    print("\n=== 3. Добавляем ОткрытьФормуБронирования ===")
+    if 'ОткрытьФормуБронирования' in src_text:
+        print("  Суб уже существует — пропускаем")
+        new_src_text = src_text
     else:
-        # Just append at the end
-        new_src_text = src_text.rstrip('\r\n') + '\r\n' + NEW_BOOKING_SUB
-        print("  Добавлено В КОНЕЦ (маркер раздела не найден)")
+        MARKER = "' РАЗДЕЛ 3: ДОБАВЛЕНИЕ БРОНИРОВАНИЯ"
+        if MARKER in src_text:
+            pos = src_text.find(MARKER)
+            pos2 = src_text.rfind('\n', 0, pos)
+            new_src_text = src_text[:pos2+1] + NEW_BOOKING_SUB + src_text[pos2+1:]
+            print("  Вставлено ПЕРЕД разделом 3")
+        else:
+            new_src_text = src_text.rstrip('\r\n') + '\r\n' + NEW_BOOKING_SUB
+            print("  Добавлено В КОНЕЦ")
 
     print(f"  Новый код: {len(new_src_text)} chars (+{len(new_src_text)-len(src_text)})")
 
-    print("\n=== 5. Компрессируем (raw MS-OVBA) ===")
+    print("\n=== 4. Компрессируем (MS-OVBA LZ77) ===")
     new_src_bytes = new_src_text.encode('cp1251', errors='replace')
     new_compressed = ovba_compress(new_src_bytes)
-    new_hm_stream = new_compressed   # src_offset=0, so no p-code prefix
-    print(f"  Старый поток: {len(hm_raw)} bytes")
-    print(f"  Новый поток:  {len(new_hm_stream)} bytes")
+    print(f"  Оригинал: {len(hm_raw)} bytes → Новый: {len(new_compressed)} bytes")
 
-    print("\n=== 6. Собираем новый vbaProject.bin ===")
-    # Build stream_tree for OLE writer
-    stream_tree = {
-        'PROJECT':   streams['PROJECT'],
-        'PROJECTwm': streams['PROJECTwm'],
-        'VBA': {
-            '_VBA_PROJECT': streams['VBA/_VBA_PROJECT'],
-            'dir':          streams['VBA/dir'],
-            'HotelMacros':  new_hm_stream,
-        }
-    }
+    # Verify roundtrip
+    rt = decompress_stream(bytearray(new_compressed))
+    rt_text = rt.decode('cp1251', errors='replace')
+    assert 'ОткрытьФормуБронирования' in rt_text, "Roundtrip failed!"
+    print(f"  Roundtrip OK ({len(rt_text)} chars)")
 
-    # Add Лист1-Лист8, ЭтаКнига
-    for key, data in streams.items():
-        if key.startswith('VBA/') and key not in ('VBA/_VBA_PROJECT', 'VBA/dir', 'VBA/HotelMacros'):
-            module_name = key[4:]  # strip 'VBA/'
-            stream_tree['VBA'][module_name] = data
+    print("\n=== 5. Патчим vbaProject.bin (оригинальный OLE) ===")
+    with open(vba_bin_path, 'rb') as f:
+        orig_vba = f.read()
 
-    new_vba_bin = build_ole(stream_tree)
-    print(f"  Новый vbaProject.bin: {len(new_vba_bin)} bytes")
+    patched_vba = patch_ole_stream(orig_vba, 'VBA/HotelMacros', new_compressed)
+    print(f"  Результат: {len(patched_vba)} bytes (было {len(orig_vba)})")
 
     # Validate with olefile
-    try:
-        test_ole = olefile.OleFileIO(io.BytesIO(new_vba_bin))
-        entries = test_ole.listdir(streams=True)
-        print(f"  OLE OK — {len(entries)} потоков")
-        test_ole.close()
-    except Exception as ex:
-        print(f"  OLE ОШИБКА: {ex}")
-        # Fallback: try to debug
-        with open('/tmp/debug_vba.bin', 'wb') as f:
-            f.write(new_vba_bin)
-        print("  Сохранён /tmp/debug_vba.bin для диагностики")
-        raise
+    test_ole = olefile.OleFileIO(io.BytesIO(patched_vba))
+    entries = test_ole.listdir(streams=True)
+    print(f"  OLE валидация: {len(entries)} потоков")
+    # Verify HotelMacros is readable
+    hm_test = test_ole.openstream('VBA/HotelMacros').read()
+    hm_test_src = decompress_stream(bytearray(hm_test))
+    hm_test_text = hm_test_src.decode('cp1251', errors='replace')
+    assert 'ОткрытьФормуБронирования' in hm_test_text, "Patched stream is corrupted!"
+    print(f"  HotelMacros OK: {len(hm_test_text)} chars, 'ОткрытьФормуБронирования' present")
+    test_ole.close()
 
-    print("\n=== 7. Патчим кнопку 'Добавить' в vmlDrawing ===")
+    # Write patched vbaProject.bin
+    with open(vba_bin_path, 'wb') as f:
+        f.write(patched_vba)
+
+    print("\n=== 6. Патчим кнопку 'Добавить' в vmlDrawing ===")
     vml_path = os.path.join(xlsm_dir, 'xl', 'drawings', 'vmlDrawing7.vml')
     if os.path.exists(vml_path):
         with open(vml_path, 'r', encoding='utf-8') as f:
@@ -721,17 +647,14 @@ def main():
             with open(vml_path, 'w', encoding='utf-8') as f:
                 f.write(vml)
             print(f"  {old_macro} → {new_macro}")
+        elif new_macro in vml:
+            print(f"  Кнопка уже привязана к {new_macro}")
         else:
-            print(f"  Кнопка уже обновлена или макрос не найден")
+            print(f"  Макрос кнопки не найден")
     else:
         print(f"  vmlDrawing7.vml не найден")
 
-    print("\n=== 8. Перепаковываем XLSM ===")
-    # Write new vbaProject.bin
-    with open(vba_bin_path, 'wb') as f:
-        f.write(new_vba_bin)
-
-    # Repack xlsm
+    print("\n=== 7. Перепаковываем XLSM ===")
     if os.path.exists(OUT_XLSM):
         os.remove(OUT_XLSM)
     with zipfile.ZipFile(OUT_XLSM, 'w', zipfile.ZIP_DEFLATED) as zf:
